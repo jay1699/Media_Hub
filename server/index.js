@@ -6,15 +6,33 @@ const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
+const path = require('path');
 require('dotenv').config();
 
+if (!process.env.JWT_SECRET || !process.env.MONGO_URI) {
+  console.error('❌ Missing required environment variables (JWT_SECRET, MONGO_URI)');
+  process.exit(1);
+}
+
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 const SECRET_KEY = process.env.JWT_SECRET;
 
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
+
+// Log all incoming requests (for debugging)
+app.use((req, res, next) => {
+  console.log(`[${req.method}] ${req.url}`);
+  if (req.body && Object.keys(req.body).length) {
+    console.log('Request Body:', req.body);
+  }
+  next();
+});
+
+// Serve static files from /public
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Swagger Setup
 const swaggerOptions = {
@@ -35,7 +53,7 @@ const swaggerOptions = {
       },
     },
     security: [{ bearerAuth: [] }],
-    servers: [{ url: 'http://localhost:5000' }],
+    servers: [{ url: `http://localhost:${PORT}` }],
   },
   apis: ['./index.js'],
 };
@@ -43,7 +61,7 @@ const swaggerOptions = {
 const swaggerDocs = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 
-// Database Connection
+// MongoDB Connection
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true
@@ -54,80 +72,6 @@ mongoose.connect(process.env.MONGO_URI, {
 // Models
 const User = require('./models/User');
 const SearchHistory = require('./models/SearchHistory');
-
-/**
- * @swagger
- * tags:
- *   name: Authentication
- *   description: User authentication and search history management
- */
-
-/**
- * @swagger
- * /api/register:
- *   post:
- *     summary: Register a new user
- *     tags: [Authentication]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               username:
- *                 type: string
- *               password:
- *                 type: string
- *     responses:
- *       201:
- *         description: User registered
- *       400:
- *         description: User already exists
- */
-app.post('/api/register', async (req, res) => {
-  const { username, password } = req.body;
-  const userExists = await User.findOne({ username });
-  if (userExists) return res.status(400).json({ message: 'User exists' });
-
-  const hash = await bcrypt.hash(password, 10);
-  const newUser = new User({ username, password: hash });
-  await newUser.save();
-  res.status(201).json({ message: 'User registered' });
-});
-
-/**
- * @swagger
- * /api/login:
- *   post:
- *     summary: Login and get JWT token
- *     tags: [Authentication]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               username:
- *                 type: string
- *               password:
- *                 type: string
- *     responses:
- *       200:
- *         description: Successful login with JWT token
- *       401:
- *         description: Invalid credentials
- */
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  const user = await User.findOne({ username });
-  if (!user || !(await bcrypt.compare(password, user.password))) {
-    return res.status(401).json({ message: 'Invalid credentials' });
-  }
-  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: '1h' });
-  res.json({ token });
-});
 
 // Authentication Middleware
 function auth(req, res, next) {
@@ -141,107 +85,98 @@ function auth(req, res, next) {
   });
 }
 
-/**
- * @swagger
- * /api/search:
- *   get:
- *     summary: Search for images (authenticated)
- *     tags: [Authentication]
- *     parameters:
- *       - in: query
- *         name: q
- *         required: true
- *         description: Search term
- *         schema:
- *           type: string
- *       - in: query
- *         name: page
- *         description: Page number
- *         schema:
- *           type: integer
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Search results
- *       500:
- *         description: Search failed
- */
+// Routes
+
+// Register
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required' });
+  }
+
+  const userExists = await User.findOne({ username });
+  if (userExists) {
+    return res.status(400).json({ message: 'User already exists' });
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+  const newUser = new User({ username, password: hash });
+  await newUser.save();
+  res.status(201).json({ message: 'User registered successfully' });
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required' });
+  }
+
+  const user = await User.findOne({ username });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: '1h' });
+  res.json({ token });
+});
+
+// Image Search (Authenticated)
 app.get('/api/search', auth, async (req, res) => {
   const axios = require('axios');
   const { q, page = 1 } = req.query;
+
+  if (!q || q.trim() === '') {
+    return res.status(400).json({ error: 'Search query (q) is required' });
+  }
+
   try {
     const result = await axios.get('https://api.openverse.engineering/v1/images', {
       params: { q, license: 'cc0', page }
     });
+
+    if (result.data.results.length === 0) {
+      return res.status(404).json({ message: 'No images found' });
+    }
+
     res.json({ results: result.data.results });
   } catch (error) {
-    res.status(500).json({ error: 'Search failed' });
+    console.error('Search error:', error.message);
+    res.status(500).json({ error: 'Search failed', message: error.message });
   }
 });
 
-/**
- * @swagger
- * /api/history:
- *   post:
- *     summary: Save search history (authenticated)
- *     tags: [Authentication]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               term:
- *                 type: string
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: History saved successfully
- */
+// Save Search History (Authenticated)
 app.post('/api/history', auth, async (req, res) => {
   const { term } = req.body;
+  if (!term || term.trim() === '') {
+    return res.status(400).json({ message: 'Search term is required' });
+  }
   await new SearchHistory({ username: req.user.username, term }).save();
-  res.json({ message: 'Saved' });
+  res.json({ message: 'Search history saved' });
 });
 
-/**
- * @swagger
- * /api/history:
- *   get:
- *     summary: Get search history (authenticated)
- *     tags: [Authentication]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: List of search history
- */
+// Get Search History (Authenticated)
 app.get('/api/history', auth, async (req, res) => {
   const data = await SearchHistory.find({ username: req.user.username })
-                                  .sort({ timestamp: -1 })
-                                  .limit(10);
+    .sort({ timestamp: -1 })
+    .limit(10);
   res.json(data);
 });
 
-/**
- * @swagger
- * /api/history:
- *   delete:
- *     summary: Clear search history (authenticated)
- *     tags: [Authentication]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: History cleared successfully
- */
+// Delete Search History (Authenticated)
 app.delete('/api/history', auth, async (req, res) => {
   await SearchHistory.deleteMany({ username: req.user.username });
-  res.json({ message: 'Cleared' });
+  res.json({ message: 'Search history cleared' });
 });
 
-// Start Server
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// Serve homepage
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
+});
